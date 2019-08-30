@@ -3,9 +3,12 @@
             [clojure.core.async :as async]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.xml :as xml])
+            [clojure.xml :as xml]
+            [taoensso.timbre :as timbre])
   (:import (java.awt.image BufferedImage)
            (javax.imageio ImageIO)))
+
+(timbre/refer-timbre)
 
 ;; HTTP
 
@@ -27,9 +30,15 @@
                               :throw-exceptions false})]
     (select-keys response [:status :body])))
 
+(defn server-error? [response]
+  (>= (:status response) 500))
+
+(defn client-error? [response]
+  (<= 400 (:status response) 499))
+
 ;; Image manipulation
 
-(defn bytes-to-image ^BufferedImage
+(defn create-image ^BufferedImage
   [^bytes image-bytes]
   (with-open [xin (io/input-stream image-bytes)]
     (ImageIO/read xin)))
@@ -75,3 +84,103 @@
        (map #(-> % :attrs :href))))
 
 ;; Pipeline
+
+(defn retrying
+  "Execute `fn` inside a try-catch block at most `max-attempts` times. `retry-fn`
+  is a one arg predicate function that determine, based on the `fn` result, if it
+  should be retried."
+  [fn retry-fn & {:keys [max-attempts] :or {max-attempts 3}}]
+  (let [try-fn #(try
+                  (debug (str "Attempt #" % "."))
+                  (let [r (fn)]
+                    (if (retry-fn r)
+                      :rflick/retry
+                      r))
+                  (catch Exception e
+                    (warn e (str "Exception on attempt #" % "."))
+                    :rflick/retry))]
+    (loop [attempt 1
+           backoff-ms 500]
+      (if (<= attempt max-attempts)
+        (let [r (try-fn attempt)]
+          (if (= r :rflick/retry)
+            (do
+              (Thread/sleep backoff-ms)
+              (recur (inc attempt) (* 1.5 backoff-ms)))
+            r))
+        :rflick/retry-error))))
+
+(defn prepare-download-feed-step [request]
+  (info (format "Received request: %s." request))
+  (let [feed-chan (async/chan)]
+    (async/thread
+      (let [response (retrying fetch-feed server-error?)]
+        (if (client-error? response)
+          (error (format "HTTP error %d when fetching feed %s." (:status response) feed-url))
+          (do
+            (async/>!! feed-chan (assoc request :feed-content (:body response)))
+            (async/close! feed-chan)))))
+    feed-chan))
+
+(defn prepare-extract-image-urls-step [feed-chan]
+  (let [urls-chan (async/chan 20)]
+    (async/go
+      (let [{:keys [num-images dimensions feed-content] :as message} (async/<! feed-chan)]
+        (info (format "Received message: %s."
+                      (assoc message :feed-content (str (subs feed-content 0 100) "..."))))
+        (let [urls (-> feed-content parse-xml extract-image-urls)
+              url-messages (take (or num-images (count urls))
+                                 (map #(into {} [[:dimensions dimensions]
+                                                 [:image-url %]])
+                                      urls))]
+          (async/onto-chan urls-chan url-messages))))
+    urls-chan))
+
+(defn prepare-download-image-step [urls-chan]
+  (let [images-chan (async/chan 20)
+        workers (vec
+                 (repeat
+                  4
+                  (async/thread
+                    (loop [{:keys [image-url] :as message} (async/<!! urls-chan)]
+                      (when image-url
+                        (info (format "Received message: %s." message))
+                        (let [response (retrying #(fetch-as-bytes image-url) server-error?)]
+                          (if (client-error? response)
+                            (error (format "HTTP error %d when downloading image %s."
+                                           (:status response) image-url))
+                            (async/>!! images-chan (assoc message :image-bytes (:body response))))
+                          (recur (async/<!! urls-chan)))))
+                    :done)))]
+
+    ;; Waiting for workers to complete in order to close `images-chan`.
+    (async/go
+      (doseq [worker workers]
+        (async/<! worker))
+      (async/close! images-chan))
+    images-chan))
+
+(defn prepare-process-image-step [images-chan]
+  (let [resized-chan (async/chan 20)
+        workers (vec
+                 (repeat
+                  4
+                  (async/go-loop [{:keys [image-url image-bytes dimensions] :as message} (async/<! images-chan)]
+                    (if image-bytes
+                      (do
+                        (info (format "Received message: %s." (dissoc message :image-bytes)))
+                        (let [resized (-> image-bytes
+                                          (create-image)
+                                          (resize-image dimensions))]
+                          (async/>! resized-chan {:image resized
+                                                  :image-url image-url})
+                          (recur (async/<! images-chan))))
+                      :done))))]
+
+    ;; Waiting for workers to complete in order to close `resized-chan`.
+    (async/go
+      (doseq [worker workers]
+        (async/<! worker))
+      (async/close! resized-chan))
+    
+    resized-chan))
