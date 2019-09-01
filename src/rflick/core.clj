@@ -4,6 +4,9 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.xml :as xml]
+            [ring.adapter.jetty :refer [run-jetty]]
+            [ring.middleware.params :refer [wrap-params]]
+            [ring.middleware.keyword-params :refer [wrap-keyword-params]]
             [taoensso.timbre :as timbre])
   (:import (java.awt.image BufferedImage)
            (javax.imageio ImageIO)))
@@ -194,3 +197,45 @@
             (save-image image (str "images/" file-name))
             (info (format "[save-image] Done processing image %s." image-url))
             (recur (async/<!! resized-chan))))))))
+
+;; HTTP server
+
+(defn parse-num-images [request]
+  (let [n (some-> (get-in request [:params :num-images])
+                  Integer/parseInt)]
+    (when (and n (<= 1 n 20))
+      n)))
+
+(defn parse-dimensions [request]
+  [(Integer/parseInt (get-in request [:params :width]))
+   (Integer/parseInt (get-in request [:params :height]))])
+
+(defn handler
+  "Handler that builds and executes the image processing pipeline for each request
+  received. The final result is having resized image files saved in the ./images
+  directory.
+
+  Supported request (query) parameters:
+  * :num-images: (optional) Number of images to process, must be 1 <= num-images <= 20.
+                 If not provided or outside the valid range, defaults to all images.
+  * :width: (required) Width of the resized images.
+  * :height: (required) Height of the resized images."
+  [request]
+  (debug (format "[handler] Received request: %s." request))
+  (let [req {:num-images (parse-num-images request)
+             :dimensions (parse-dimensions request)}]
+    (-> (prepare-download-feed-step req)
+        (prepare-extract-image-urls-step)
+        (prepare-download-image-step)
+        (prepare-process-image-step)
+        (prepare-save-image-step))
+    {:status 202
+     :headers {}}))
+
+(def app
+  (-> handler
+      wrap-keyword-params
+      wrap-params))
+
+(defn -main []
+  (run-jetty app {:port 3000}))
