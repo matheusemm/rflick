@@ -1,11 +1,8 @@
 (ns rflick.image
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [taoensso.timbre :as timbre])
+            [clojure.string :as str])
   (:import (java.awt.image BufferedImage)
            (javax.imageio ImageIO)))
-
-(timbre/refer-timbre)
 
 (defn create-image ^BufferedImage
   [^bytes image-bytes]

@@ -1,8 +1,5 @@
 (ns rflick.http
-  (:require [clj-http.client :as client]
-            [taoensso.timbre :as timbre]))
-
-(timbre/refer-timbre)
+  (:require [clj-http.client :as client]))
 
 (def feed-url "https://www.flickr.com/services/feeds/photos_public.gne")
 
