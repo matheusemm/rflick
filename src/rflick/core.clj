@@ -23,7 +23,7 @@
                               :throw-exceptions false})]
     (select-keys response [:status :body])))
 
-(defn fetch-as-bytes ^bytes
+(defn fetch-image ^bytes
   [url]
   (let [response (client/get url
                              {:as :byte-array
@@ -110,13 +110,19 @@
             r))
         :rflick/retry-error))))
 
+(defn wait-and-close [workers ch]
+  (async/go
+      (doseq [worker workers]
+        (async/<! worker))
+      (async/close! ch)))
+
 (defn prepare-download-feed-step [request]
-  (info (format "Received request: %s." request))
+  (info (format "[download-feed] Received request: %s." request))
   (let [feed-chan (async/chan)]
     (async/thread
       (let [response (retrying fetch-feed server-error?)]
         (if (client-error? response)
-          (error (format "HTTP error %d when fetching feed %s." (:status response) feed-url))
+          (error (format "[download-feed] HTTP error %d when fetching feed %s." (:status response) feed-url))
           (do
             (async/>!! feed-chan (assoc request :feed-content (:body response)))
             (async/close! feed-chan)))))
@@ -126,7 +132,7 @@
   (let [urls-chan (async/chan 20)]
     (async/go
       (let [{:keys [num-images dimensions feed-content] :as message} (async/<! feed-chan)]
-        (info (format "Received message: %s."
+        (info (format "[extract-urls] Received message: %s."
                       (assoc message :feed-content (str (subs feed-content 0 100) "..."))))
         (let [urls (-> feed-content parse-xml extract-image-urls)
               url-messages (take (or num-images (count urls))
@@ -144,20 +150,16 @@
                   (async/thread
                     (loop [{:keys [image-url] :as message} (async/<!! urls-chan)]
                       (when image-url
-                        (info (format "Received message: %s." message))
-                        (let [response (retrying #(fetch-as-bytes image-url) server-error?)]
+                        (info (format "[download-image] Received message: %s." message))
+                        (let [response (retrying #(fetch-image image-url) server-error?)]
                           (if (client-error? response)
-                            (error (format "HTTP error %d when downloading image %s."
+                            (error (format "[download-image] HTTP error %d when downloading image %s."
                                            (:status response) image-url))
                             (async/>!! images-chan (assoc message :image-bytes (:body response))))
                           (recur (async/<!! urls-chan)))))
                     :done)))]
 
-    ;; Waiting for workers to complete in order to close `images-chan`.
-    (async/go
-      (doseq [worker workers]
-        (async/<! worker))
-      (async/close! images-chan))
+    (wait-and-close workers images-chan)
     images-chan))
 
 (defn prepare-process-image-step [images-chan]
@@ -168,7 +170,9 @@
                   (async/go-loop [{:keys [image-url image-bytes dimensions] :as message} (async/<! images-chan)]
                     (if image-bytes
                       (do
-                        (info (format "Received message: %s." (dissoc message :image-bytes)))
+                        (info (format "[process-image] Received message: %s." (-> message
+                                                                                  (dissoc :image-bytes)
+                                                                                  (assoc :image-size (count image-bytes)))))
                         (let [resized (-> image-bytes
                                           (create-image)
                                           (resize-image dimensions))]
@@ -177,10 +181,16 @@
                           (recur (async/<! images-chan))))
                       :done))))]
 
-    ;; Waiting for workers to complete in order to close `resized-chan`.
-    (async/go
-      (doseq [worker workers]
-        (async/<! worker))
-      (async/close! resized-chan))
-    
+    (wait-and-close workers resized-chan)    
     resized-chan))
+
+(defn prepare-save-image-step [resized-chan]
+  (dotimes [_ 4]
+    (async/thread
+      (loop [{:keys [image image-url] :as message} (async/<!! resized-chan)]
+        (when image
+          (info (format "[save-image] Received message: %s." message))
+          (let [file-name (subs image-url (inc (str/last-index-of image-url "/")))]
+            (save-image image (str "images/" file-name))
+            (info (format "[save-image] Done processing image %s." image-url))
+            (recur (async/<!! resized-chan))))))))
