@@ -31,11 +31,7 @@
   (debug (format "[handler] Received request: %s." request))
   (let [req {:num-images (parse-num-images request)
              :dimensions (parse-dimensions request)}]
-    (-> (p/prepare-download-feed-step req)
-        (p/prepare-extract-image-urls-step)
-        (p/prepare-download-image-step)
-        (p/prepare-process-image-step)
-        (p/prepare-save-image-step))
+    (p/run-pipeline req)
     {:status 202
      :headers {}}))
 
@@ -44,5 +40,9 @@
       wrap-keyword-params
       wrap-params))
 
+(defn create-images-dir []
+  (clojure.java.io/make-parents "images/fake-file.txt"))
+
 (defn -main []
+  (create-images-dir)
   (run-jetty app {:port 3000}))
